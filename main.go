@@ -96,7 +96,7 @@ func (c *vkcloudDNSSolver) CleanUp(ch *acme.ChallengeRequest) error {
 		return err
 	}
 
-	err = deleteTXTRecord(dnsZoneID, ch.ResolvedFQDN, ch.Key, authToken)
+	err = deleteTXTRecord(dnsZoneID, ch.ResolvedZone, ch.ResolvedFQDN, ch.Key, authToken)
 	if err != nil {
 		return err
 	}
@@ -252,8 +252,45 @@ func createTXTRecord(zoneID, fqdn, key, token string) error {
 	return nil
 }
 
-// deleteTXTRecord removes the specific TXT record
-func deleteTXTRecord(zoneID, fqdn, key, token string) error {
+type txtRecord struct {
+	UUID    string `json:"uuid"`
+	Name    string `json:"name"`
+	Content string `json:"content"`
+}
+
+// normalizeDNSName trims a trailing dot and lowercases the name.
+func normalizeDNSName(name string) string {
+	return strings.ToLower(strings.TrimSuffix(name, "."))
+}
+
+// relativeRecordName converts an FQDN (or already-relative name) to the
+// relative form stored by VK Public DNS (e.g. "_acme-challenge.dev").
+func relativeRecordName(name, zone string) string {
+	n := normalizeDNSName(name)
+	z := normalizeDNSName(zone)
+	if z != "" && strings.HasSuffix(n, "."+z) {
+		return strings.TrimSuffix(n, "."+z)
+	}
+	if n == z {
+		return "@"
+	}
+	return n
+}
+
+// recordNamesMatch reports whether API record name and challenge FQDN refer
+// to the same RR, accounting for relative vs absolute forms.
+func recordNamesMatch(apiName, fqdn, zone string) bool {
+	a := normalizeDNSName(apiName)
+	b := normalizeDNSName(fqdn)
+	if a == b {
+		return true
+	}
+	return relativeRecordName(a, zone) == relativeRecordName(b, zone)
+}
+
+// deleteTXTRecord removes the specific TXT record.
+// VK Public DNS returns TXT records as a bare JSON array, not {"txt_records":[...]}.
+func deleteTXTRecord(zoneID, zone, fqdn, key, token string) error {
 	zoneTXTRecordsURL := dnsAPIBaseURL + "%s/txt/"
 	url := fmt.Sprintf(zoneTXTRecordsURL, zoneID)
 
@@ -268,48 +305,53 @@ func deleteTXTRecord(zoneID, fqdn, key, token string) error {
 	}
 	defer resp.Body.Close()
 
-	var recordsResponse struct {
-		TXTRecords []struct {
-			UUID    string `json:"uuid"`
-			Name    string `json:"name"`
-			Content string `json:"content"`
-		} `json:"txt_records"`
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read TXT records response: %w", err)
 	}
 
-	body, _ := io.ReadAll(resp.Body)
-	if err := json.Unmarshal(body, &recordsResponse); err != nil {
+	var records []txtRecord
+	if err := json.Unmarshal(body, &records); err != nil {
 		return fmt.Errorf("failed to parse TXT records: %w", err)
 	}
 
 	var deleteErrors []string
+	deleted := 0
 
-	for _, r := range recordsResponse.TXTRecords {
-		if r.Name == fqdn && r.Content == key {
-			zoneTXTRecordsURL := dnsAPIBaseURL + "%s/txt/%s"
-			deleteURL := fmt.Sprintf(zoneTXTRecordsURL, zoneID, r.UUID)
-
-			delReq, _ := http.NewRequest("DELETE", deleteURL, nil)
-			delReq.Header.Set("X-Auth-Token", token)
-
-			resp, err := httpClient.Do(delReq)
-			if err != nil {
-				deleteErrors = append(deleteErrors, fmt.Sprintf("failed to delete TXT record %q: %v", r.UUID, err))
-				continue
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-				deleteErrors = append(deleteErrors, fmt.Sprintf(
-					"failed to delete TXT record %q: unexpected status code %d",
-					r.UUID,
-					resp.StatusCode,
-				))
-			}
+	for _, r := range records {
+		if !recordNamesMatch(r.Name, fqdn, zone) || r.Content != key {
+			continue
 		}
+
+		deleteURL := fmt.Sprintf(dnsAPIBaseURL+"%s/txt/%s", zoneID, r.UUID)
+		delReq, _ := http.NewRequest("DELETE", deleteURL, nil)
+		delReq.Header.Set("X-Auth-Token", token)
+
+		delResp, err := httpClient.Do(delReq)
+		if err != nil {
+			deleteErrors = append(deleteErrors, fmt.Sprintf("failed to delete TXT record %q: %v", r.UUID, err))
+			continue
+		}
+		_, _ = io.Copy(io.Discard, delResp.Body)
+		delResp.Body.Close()
+
+		if delResp.StatusCode != http.StatusOK && delResp.StatusCode != http.StatusNoContent {
+			deleteErrors = append(deleteErrors, fmt.Sprintf(
+				"failed to delete TXT record %q: unexpected status code %d",
+				r.UUID,
+				delResp.StatusCode,
+			))
+			continue
+		}
+		deleted++
 	}
 
 	if len(deleteErrors) > 0 {
 		return fmt.Errorf("one or more TXT records failed to delete:\n%s", strings.Join(deleteErrors, "\n"))
+	}
+	if deleted == 0 {
+		// Idempotent: record already gone is fine for ACME cleanup.
+		return nil
 	}
 
 	return nil
