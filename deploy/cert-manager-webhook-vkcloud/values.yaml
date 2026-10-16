@@ -13,10 +13,9 @@ certManager:
   serviceAccountName: cert-manager
 
 image:
-  repository: drone076/cert-manager-webhook-vkcloud
-  tag: latest
-  pullPolicy: Always
-  # pullPolicy: IfNotPresent
+  repository: ghcr.io/russian-developer/cert-manager-webhook-vkcloud
+  tag: v1.0.9
+  pullPolicy: IfNotPresent
 
 nameOverride: ""
 fullnameOverride: ""

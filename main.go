@@ -288,6 +288,23 @@ func recordNamesMatch(apiName, fqdn, zone string) bool {
 	return relativeRecordName(a, zone) == relativeRecordName(b, zone)
 }
 
+// parseTXTRecords accepts either a bare TXT array (current VK Public DNS)
+// or the legacy {"txt_records":[...]} wrapper.
+func parseTXTRecords(body []byte) ([]txtRecord, error) {
+	var records []txtRecord
+	if err := json.Unmarshal(body, &records); err == nil {
+		return records, nil
+	}
+
+	var wrapped struct {
+		TXTRecords []txtRecord `json:"txt_records"`
+	}
+	if err := json.Unmarshal(body, &wrapped); err != nil {
+		return nil, fmt.Errorf("failed to parse TXT records: %w", err)
+	}
+	return wrapped.TXTRecords, nil
+}
+
 // deleteTXTRecord removes the specific TXT record.
 // VK Public DNS returns TXT records as a bare JSON array, not {"txt_records":[...]}.
 func deleteTXTRecord(zoneID, zone, fqdn, key, token string) error {
@@ -310,9 +327,9 @@ func deleteTXTRecord(zoneID, zone, fqdn, key, token string) error {
 		return fmt.Errorf("failed to read TXT records response: %w", err)
 	}
 
-	var records []txtRecord
-	if err := json.Unmarshal(body, &records); err != nil {
-		return fmt.Errorf("failed to parse TXT records: %w", err)
+	records, err := parseTXTRecords(body)
+	if err != nil {
+		return err
 	}
 
 	var deleteErrors []string
